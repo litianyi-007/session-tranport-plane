@@ -16,7 +16,7 @@ import {
   toIso,
   walkFiles,
 } from "../util.js";
-import type { AgentAdapter, DiscoverOpts, LaunchOpts, LaunchPlan, SessionRef } from "./types.js";
+import type { AgentAdapter, CodexHomeSelection, DiscoverOpts, LaunchOpts, LaunchPlan, SessionRef } from "./types.js";
 
 export function codexRoot(env: NodeJS.ProcessEnv): string {
   return envPath(env, "CODEX_HOME", join(homeDir(env), ".codex"));
@@ -26,27 +26,20 @@ export const codexAdapter: AgentAdapter = {
   id: "codex",
   aliases: [],
   summary:
-    "Reads Codex CLI rollout JSONL under $CODEX_HOME/sessions/YYYY/MM/DD (default ~/.codex). Native fork delegates to `codex fork <id>`. Archived sessions are included.",
+    "Reads Codex CLI rollout JSONL under each CODEX_HOME (default ~/.codex, or every [profiles.codex.*] home). Native fork delegates to `codex fork <id>` only when the source and target homes match. Archived sessions are included.",
   capabilities: { nativeFork: true, resumeInPlace: true, launchable: true },
   discover(opts) {
-    const root = codexRoot(opts.env);
-    const files = [
-      ...rolloutFiles(join(root, "sessions")),
-      ...rolloutFiles(join(root, "archived_sessions")),
-    ];
-    const ranked = files
-      .map((file) => ({ file, mtime: mtimeIso(file) ?? "" }))
-      .sort((a, b) => b.mtime.localeCompare(a.mtime));
-    const refs: SessionRef[] = [];
+    const homes = opts.codexHomes && opts.codexHomes.length > 0
+      ? opts.codexHomes
+      : [{ name: "", home: codexRoot(opts.env), configured: false }];
     const limit = opts.matchLimit ?? 50;
-    const scanCap = opts.allDirs ? 3000 : 2000;
-    for (const item of ranked.slice(0, scanCap)) {
-      const ref = refFromRollout(item.file, item.mtime, opts);
-      if (!ref) continue;
-      refs.push(ref);
-      if (refs.length >= limit) break;
+    const refs: SessionRef[] = [];
+    for (const home of homes) {
+      refs.push(...discoverHome(home, opts, limit));
     }
-    return refs;
+    return refs
+      .sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""))
+      .slice(0, limit);
   },
   read(ref) {
     return parseCodexRollout(readText(ref.path), ref);
@@ -55,6 +48,29 @@ export const codexAdapter: AgentAdapter = {
     return launchCodex(opts);
   },
 };
+
+function discoverHome(home: CodexHomeSelection, opts: DiscoverOpts, limit: number): SessionRef[] {
+  const files = [
+    ...rolloutFiles(join(home.home, "sessions")),
+    ...rolloutFiles(join(home.home, "archived_sessions")),
+  ];
+  const ranked = files
+    .map((file) => ({ file, mtime: mtimeIso(file) ?? "" }))
+    .sort((a, b) => b.mtime.localeCompare(a.mtime));
+  const refs: SessionRef[] = [];
+  const scanCap = opts.allDirs ? 3000 : 2000;
+  for (const item of ranked.slice(0, scanCap)) {
+    const ref = refFromRollout(item.file, item.mtime, opts);
+    if (!ref) continue;
+    if (home.name) {
+      ref.profile = home.name;
+      ref.accountHome = home.home;
+    }
+    refs.push(ref);
+    if (refs.length >= limit) break;
+  }
+  return refs;
+}
 
 function rolloutFiles(root: string): string[] {
   return walkFiles(root, (_file, name) => name.startsWith("rollout-") && name.endsWith(".jsonl"), 8000);
@@ -323,12 +339,14 @@ function idFromName(file: string): string {
 }
 
 function launchCodex(opts: LaunchOpts): LaunchPlan {
+  const env = opts.codexHome ? { CODEX_HOME: opts.codexHome } : undefined;
   if (opts.mode === "nativeFork" && opts.nativeId) {
     return {
       argv: ["codex", "fork", opts.nativeId],
       cwd: opts.cwd,
       mode: "nativeFork",
       note: "Native fork via `codex fork`. The source rollout is left unchanged.",
+      env,
     };
   }
   if (opts.mode === "resume" && opts.nativeId) {
@@ -337,13 +355,15 @@ function launchCodex(opts: LaunchOpts): LaunchPlan {
       cwd: opts.cwd,
       mode: "resume",
       note: "Resume in place via `codex resume`. Later turns append to the same thread.",
+      env,
     };
   }
   return {
     argv: ["codex", opts.prompt ?? "Continue from the handoff seed."],
     cwd: opts.cwd,
     mode: "projection",
-    note: "Projection launch. Codex starts a fresh thread seeded with the handoff prompt.",
+    note: "Projection launch. Codex starts a fresh thread seeded with the handoff prompt. Native session state was not copied.",
+    env,
   };
 }
 

@@ -1,9 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { discoverAll, findRef, listAdapters, requireAdapter, resolveAdapter } from "./adapters/index.js";
-import type { SessionRef } from "./adapters/types.js";
-import { loadConfig } from "./config.js";
+import type { DiscoverOpts, SessionRef } from "./adapters/types.js";
+import { loadConfig, type StpConfig } from "./config.js";
 import { DEFAULT_CONFIG } from "./config.js";
 import {
   buildCsir,
@@ -16,10 +16,18 @@ import {
 } from "./csir.js";
 import { workspaceFingerprint } from "./fingerprint.js";
 import { projectAgent, projectHuman } from "./project.js";
+import {
+  codexChildEnv,
+  codexHomesForDiscover,
+  formatEndpoint,
+  resolveCodexTarget,
+  sameHome,
+  type CodexEndpoint,
+} from "./profiles.js";
 import { redactCsir } from "./redact.js";
 import { commandExists, jsonPretty, StpError, stpId } from "./util.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 export interface ParsedArgs {
   command?: "list" | "read" | "fork" | "init" | "help";
@@ -40,6 +48,11 @@ export interface ParsedArgs {
   projection: boolean;
   limit: number;
   fidelity?: Fidelity;
+  profile?: string;
+  codexHome?: string;
+  intoProfile?: string;
+  intoCodexHome?: string;
+  allProfiles: boolean;
 }
 
 const COMMANDS = new Set(["list", "read", "fork", "init", "help"]);
@@ -58,6 +71,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     noLaunch: false,
     projection: false,
     limit: 20,
+    allProfiles: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i] ?? "";
@@ -82,6 +96,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
       continue;
     }
     if (token === "--all-agents") continue;
+    if (token === "--all-profiles") {
+      parsed.allProfiles = true;
+      continue;
+    }
     if (token === "--since-compact") {
       parsed.sinceCompact = true;
       continue;
@@ -110,7 +128,18 @@ export function parseArgs(argv: string[]): ParsedArgs {
       parsed.agentDetail = true;
       continue;
     }
-    if (token === "--id" || token === "--into" || token === "--from" || token === "--last" || token === "--limit" || token === "--fidelity") {
+    if (
+      token === "--id" ||
+      token === "--into" ||
+      token === "--from" ||
+      token === "--last" ||
+      token === "--limit" ||
+      token === "--fidelity" ||
+      token === "--profile" ||
+      token === "--codex-home" ||
+      token === "--into-profile" ||
+      token === "--into-codex-home"
+    ) {
       const value = argv[i + 1];
       if (value === undefined || value.startsWith("-") && token !== "--from") {
         throw new StpError(`${token} requires a value`);
@@ -123,7 +152,11 @@ export function parseArgs(argv: string[]): ParsedArgs {
         parsed.fromStdin = true;
       } else if (token === "--last") parsed.last = positiveInt(value, "--last");
       else if (token === "--limit") parsed.limit = positiveInt(value, "--limit");
-      else parsed.fidelity = parseFidelity(value);
+      else if (token === "--fidelity") parsed.fidelity = parseFidelity(value);
+      else if (token === "--profile") parsed.profile = value;
+      else if (token === "--codex-home") parsed.codexHome = value;
+      else if (token === "--into-profile") parsed.intoProfile = value;
+      else if (token === "--into-codex-home") parsed.intoCodexHome = value;
       continue;
     }
     if (token.startsWith("-")) throw new StpError(`Unknown flag ${token}`);
@@ -176,13 +209,10 @@ export async function main(argv: string[]): Promise<number> {
 
 function runList(args: ParsedArgs): number {
   const cwd = process.cwd();
-  const { disabled } = disabledSet(cwd);
+  const config = loadConfig(cwd);
+  const { disabled } = disabledSet(config);
   if (args.agent) requireAdapter(args.agent);
-  const refs = discoverAll(
-    { cwd, allDirs: args.allDirs, env: process.env, matchLimit: Math.max(args.limit, 50) },
-    disabled,
-    args.agent,
-  ).slice(0, args.limit);
+  const refs = discoverAll(discoverOpts(args, cwd, config, Math.max(args.limit, 50)), disabled, args.agent).slice(0, args.limit);
   if (args.json) {
     process.stdout.write(jsonPretty(refs.map(toListJson)));
     return 0;
@@ -203,7 +233,8 @@ function runRead(args: ParsedArgs): number {
   if (args.positionals.length > 1) throw new StpError(`unexpected argument ${args.positionals[1]}`);
   const adapter = requireAdapter(name);
   const cwd = process.cwd();
-  const ref = selectRef(adapter.id, args, cwd);
+  const config = loadConfig(cwd);
+  const ref = selectRef(adapter.id, args, cwd, config);
   let csir = finishCsir(adapter.read(ref), ref);
   csir = sliceCsir(csir, args);
   if (args.json) {
@@ -226,21 +257,57 @@ async function runFork(args: ParsedArgs): Promise<number> {
   const cwd = process.cwd();
   const config = loadConfig(cwd);
   const fidelity = args.fidelity ?? config.fidelity ?? "L2";
-  const loaded = args.fromStdin ? await csirFromStdin(cwd) : csirFromAdapter(args, cwd);
+  const loaded = args.fromStdin ? await csirFromStdin(cwd) : csirFromAdapter(args, cwd, config);
   let csir = sliceCsir(loaded.csir, args);
   const sourceAgent = csir.session.agent;
-  const targetName = args.into ?? sourceAgent;
+  let targetName = args.into ?? sourceAgent;
+  if (!args.into && (args.intoProfile || args.intoCodexHome)) targetName = "codex";
   const target = requireAdapter(targetName);
+  if ((args.intoProfile || args.intoCodexHome) && target.id !== "codex") {
+    throw new StpError("--into-profile and --into-codex-home select a Codex account. Omit --into or pass --into codex.");
+  }
+  const sourceEndpoint = sourceAgent === "codex" ? sourceCodexEndpoint(args, config, loaded.ref) : undefined;
+  const targetEndpoint =
+    target.id === "codex" && sourceEndpoint
+      ? resolveCodexTarget({
+          config,
+          env: process.env,
+          intoProfile: args.intoProfile,
+          intoCodexHome: args.intoCodexHome,
+          source: sourceEndpoint,
+        })
+      : target.id === "codex"
+        ? resolveCodexTarget({
+            config,
+            env: process.env,
+            intoProfile: args.intoProfile,
+            intoCodexHome: args.intoCodexHome,
+            source: {
+              name: "",
+              home: codexHomesForDiscover({ config, env: process.env }).map((home) => home.home)[0] ?? "",
+            },
+          })
+        : undefined;
+  const crossAccount = Boolean(
+    sourceEndpoint &&
+      targetEndpoint &&
+      sourceEndpoint.home &&
+      targetEndpoint.home &&
+      !sameHome(sourceEndpoint.home, targetEndpoint.home),
+  );
   const same = target.id === sourceAgent;
   const trimmed = args.sinceCompact || args.last !== undefined;
   let mode: "nativeFork" | "resume" | "projection";
-  if (same && !args.projection && !trimmed && target.capabilities.nativeFork && !args.fromStdin) {
+  if (crossAccount) {
+    mode = "projection";
+  } else if (same && !args.projection && !trimmed && target.capabilities.nativeFork && !args.fromStdin) {
     mode = "nativeFork";
   } else if (same && !args.projection && !trimmed && target.capabilities.resumeInPlace && !args.fromStdin) {
     mode = "resume";
   } else {
     mode = "projection";
   }
+  if (targetEndpoint?.home) assertCodexHomeExists(targetEndpoint.home);
 
   const workCwd = csir.session.cwd || cwd;
   let seedPath: string | undefined;
@@ -271,6 +338,10 @@ async function runFork(args: ParsedArgs): Promise<number> {
         native_id: csir.session.native_id,
         fidelity,
         seed: seedPath,
+        from_profile: sourceEndpoint?.name || undefined,
+        from_home: sourceEndpoint?.home,
+        into_profile: targetEndpoint?.name || undefined,
+        into_home: targetEndpoint?.home,
         workspace_fingerprint: csir.workspace_fingerprint ?? null,
       }),
     );
@@ -292,11 +363,18 @@ async function runFork(args: ParsedArgs): Promise<number> {
     prompt,
     cwd: workCwd,
     env: process.env,
+    codexHome: target.id === "codex" ? targetEndpoint?.home : undefined,
   });
 
+  if (crossAccount && sourceEndpoint && targetEndpoint) {
+    process.stdout.write(`projection fork: ${formatEndpoint(sourceEndpoint)} → ${formatEndpoint(targetEndpoint)}\n`);
+  }
   process.stdout.write(`kind: ${plan.mode === "nativeFork" ? "native-fork" : plan.mode === "resume" ? "resume-in-place" : "projection"}\n`);
   process.stdout.write(`from: ${sourceAgent} ${csir.session.native_id}\n`);
   process.stdout.write(`into: ${target.id}\n`);
+  if (target.id === "codex" && targetEndpoint?.home) {
+    process.stdout.write(`CODEX_HOME=${targetEndpoint.home}\n`);
+  }
   if (seedPath) process.stdout.write(`seed: ${seedPath}\n`);
   if (plan.argv.length > 0) process.stdout.write(`command: ${plan.argv.map(shellWord).join(" ")}\n`);
   process.stdout.write(`${plan.note}\n`);
@@ -316,7 +394,7 @@ async function runFork(args: ParsedArgs): Promise<number> {
   const child = spawnSync(bin, plan.argv.slice(1), {
     cwd: plan.cwd,
     stdio: "inherit",
-    env: process.env,
+    env: codexChildEnv(process.env, plan.env?.CODEX_HOME),
   });
   if (child.error) throw new StpError(child.error.message);
   return child.status ?? 1;
@@ -341,15 +419,15 @@ function runInit(args: ParsedArgs): number {
   return 0;
 }
 
-function csirFromAdapter(args: ParsedArgs, cwd: string): { csir: CSIR; ref: SessionRef } {
+function csirFromAdapter(args: ParsedArgs, cwd: string, config: StpConfig): { csir: CSIR; ref: SessionRef } {
   const hinted = args.positionals[0];
   if (hinted) {
     const adapter = requireAdapter(hinted);
-    const ref = selectRef(adapter.id, args, cwd);
+    const ref = selectRef(adapter.id, args, cwd, config);
     return { csir: finishCsir(adapter.read(ref), ref), ref };
   }
-  const { disabled } = disabledSet(cwd);
-  const refs = discoverAll({ cwd, allDirs: args.allDirs, env: process.env, matchLimit: 50 }, disabled);
+  const { disabled } = disabledSet(config);
+  const refs = discoverAll(discoverOpts(args, cwd, config, 50), disabled);
   if (refs.length === 0) {
     throw new StpError("No sessions found in this directory. Pass an agent, --all-dirs, or --from -.");
   }
@@ -389,19 +467,14 @@ function readStdin(): Promise<string> {
   });
 }
 
-function selectRef(agentId: string, args: ParsedArgs, cwd: string): SessionRef {
+function selectRef(agentId: string, args: ParsedArgs, cwd: string, config: StpConfig): SessionRef {
   const adapter = requireAdapter(agentId);
-  const refs = adapter.discover({
-    cwd,
-    allDirs: args.allDirs,
-    env: process.env,
-    matchLimit: 100,
-  });
+  const refs = adapter.discover(discoverOpts(args, cwd, config, 100));
   if (args.id) {
     const found = matchId(refs, args.id);
     if (found) return found;
     if (!args.allDirs) {
-      const wider = adapter.discover({ cwd, allDirs: true, env: process.env, matchLimit: 200 });
+      const wider = adapter.discover({ ...discoverOpts(args, cwd, config, 200), allDirs: true });
       const anywhere = matchId(wider, args.id);
       if (anywhere) return anywhere;
     }
@@ -438,8 +511,7 @@ function sliceCsir(csir: CSIR, args: ParsedArgs): CSIR {
   return withEvents(csir, sliceEvents(csir.events, { sinceCompact: args.sinceCompact, last: args.last }));
 }
 
-function disabledSet(cwd: string): { disabled: Set<string> } {
-  const config = loadConfig(cwd);
+function disabledSet(config: StpConfig): { disabled: Set<string> } {
   const disabled = new Set<string>();
   for (const name of config.disabled) {
     disabled.add(resolveAdapter(name)?.id ?? name);
@@ -447,8 +519,52 @@ function disabledSet(cwd: string): { disabled: Set<string> } {
   return { disabled };
 }
 
-function toListJson(ref: SessionRef): Record<string, string | undefined> {
+function discoverOpts(args: ParsedArgs, cwd: string, config: StpConfig, matchLimit: number): DiscoverOpts {
   return {
+    cwd,
+    allDirs: args.allDirs,
+    env: process.env,
+    matchLimit,
+    codexHomes: codexHomesForDiscover({
+      config,
+      env: process.env,
+      profile: args.profile,
+      codexHome: args.codexHome,
+    }),
+  };
+}
+
+function sourceCodexEndpoint(args: ParsedArgs, config: StpConfig, ref: SessionRef | undefined): CodexEndpoint {
+  const homes = codexHomesForDiscover({
+    config,
+    env: process.env,
+    profile: args.profile,
+    codexHome: args.codexHome,
+  });
+  if (ref?.accountHome) {
+    return { name: ref.profile ?? homes[0]?.name ?? "", home: ref.accountHome };
+  }
+  const only = homes[0];
+  if (!only) throw new StpError("No Codex home is configured.");
+  return { name: only.name, home: only.home, label: only.label };
+}
+
+function assertCodexHomeExists(home: string): void {
+  if (existsSync(home)) {
+    if (!existsSync(join(home, "auth.json"))) {
+      process.stderr.write(
+        `stp: ${home} has no auth.json. Log in once with CODEX_HOME set to that directory. STP does not copy credentials.\n`,
+      );
+    }
+    return;
+  }
+  throw new StpError(
+    `Codex home ${home} does not exist. Create it and log in once (CODEX_HOME=${home} codex login) before forking into it.`,
+  );
+}
+
+function toListJson(ref: SessionRef): Record<string, string | undefined> {
+  const row: Record<string, string | undefined> = {
     agent: ref.agent,
     native_id: ref.nativeId,
     stp_id: stpId(ref.agent, ref.nativeId),
@@ -457,16 +573,25 @@ function toListJson(ref: SessionRef): Record<string, string | undefined> {
     updated_at: ref.updatedAt,
     path: ref.path,
   };
+  if (ref.profile) row.profile = ref.profile;
+  if (ref.accountHome) row.home = ref.accountHome;
+  return row;
 }
 
 function formatTable(refs: SessionRef[]): string {
-  const header = ["AGENT", "UPDATED", "ID", "TITLE"];
-  const rows = refs.map((ref) => [
-    ref.agent,
-    (ref.updatedAt ?? "").replace(/\.\d{3}Z$/, "Z"),
-    ref.nativeId,
-    ref.title ?? ref.preview ?? "",
-  ]);
+  const tagged = refs.some((ref) => ref.profile);
+  const header = tagged ? ["AGENT", "PROFILE", "UPDATED", "ID", "TITLE"] : ["AGENT", "UPDATED", "ID", "TITLE"];
+  const rows = refs.map((ref) => {
+    const base = [
+      ref.agent,
+      (ref.updatedAt ?? "").replace(/\.\d{3}Z$/, "Z"),
+      ref.nativeId,
+      ref.title ?? ref.preview ?? "",
+    ];
+    if (!tagged) return base;
+    const profile = ref.profile ? `${ref.profile} (${ref.accountHome ?? ""})` : "";
+    return [ref.agent, profile, base[1] ?? "", base[2] ?? "", base[3] ?? ""];
+  });
   const widths = header.map((cell, index) =>
     Math.min(36, Math.max(cell.length, ...rows.map((row) => (row[index] ?? "").length))),
   );
@@ -529,11 +654,16 @@ function commandHelp(command: string): string {
 
 Usage:
   stp list [--agent <name>] [--all-dirs] [--limit <n>] [--json]
+           [--profile <name>] [--codex-home <path>] [--all-profiles]
 
-  --agent <name>   One adapter (codex, cursor, pi, agy, grok, deepseek, claude)
-  --all-dirs       Do not filter on the current directory
-  --limit <n>      How many rows to print (default 20)
-  --json           Print CSIR-adjacent session refs as JSON
+  --agent <name>      One adapter (codex, cursor, pi, agy, grok, deepseek, claude)
+  --all-dirs          Do not filter on the current directory
+  --limit <n>         How many rows to print (default 20)
+  --json              Print session refs as JSON
+  --profile <name>    Only this Codex account profile
+  --codex-home <path> Only this Codex home (instead of --profile)
+  --all-profiles      Scan every configured Codex profile (this is the default
+                      when profiles exist)
 `;
   }
   if (command === "read") {
@@ -542,14 +672,17 @@ Usage:
 Usage:
   stp read <agent> [--id <id>] [--last <n>] [--since-compact] [--agent] [--json]
                    [--fidelity L1|L2|L3] [--all-dirs]
+                   [--profile <name> | --codex-home <path>]
 
-  --id <id>        Native id, stp_ id, or transcript path
-  --last <n>       Keep the last n user exchanges
-  --since-compact  Drop events before the latest compaction boundary
-  --agent          Agent markdown (L2: dialog + failed tool calls)
-  --json           Print sliced CSIR JSON instead of markdown
-  --fidelity       L1 dialog, L2 dialog+failed tools, L3 all parsed tools
-  --all-dirs       Search outside the current directory
+  --id <id>           Native id, stp_ id, or transcript path
+  --last <n>          Keep the last n user exchanges
+  --since-compact     Drop events before the latest compaction boundary
+  --agent             Agent markdown (L2: dialog + failed tool calls)
+  --json              Print sliced CSIR JSON instead of markdown
+  --fidelity          L1 dialog, L2 dialog+failed tools, L3 all parsed tools
+  --all-dirs          Search outside the current directory
+  --profile <name>    Read from this Codex account profile
+  --codex-home <path> Read from this Codex home
 
 Without --agent the default rendering is human markdown at L1.
 --json keeps every parsed event in the slice, including successful tools,
@@ -563,16 +696,26 @@ Usage:
   stp fork [agent] [--into <agent>] [--from -] [--id <id>] [--last <n>]
                    [--since-compact] [--fidelity L1|L2|L3] [--projection]
                    [--no-launch] [--dry-run] [--all-dirs]
+                   [--profile <name> | --codex-home <path>]
+                   [--into-profile <name> | --into-codex-home <path>]
 
-  --into <agent>   Target. Default: the source agent
-  --from -         Read CSIR JSON or markdown from stdin instead of a local session
-  --id <id>        Source session
-  --last <n>       Seed only the last n user exchanges
-  --since-compact  Seed from the latest compaction boundary
-  --projection     Force a projection seed even when native fork exists
-  --no-launch      Write the seed or print the native command, do not spawn
-  --dry-run        Print the plan. Projection seeds are still written
-  --fidelity       Default L2 (or fidelity from .stp/config.toml)
+  --into <agent>         Target. Default: the source agent
+  --from -               Read CSIR JSON or markdown from stdin instead of a local session
+  --id <id>              Source session
+  --last <n>             Seed only the last n user exchanges
+  --since-compact        Seed from the latest compaction boundary
+  --projection           Force a projection seed even when native fork exists
+  --no-launch            Write the seed or print the native command, do not spawn
+  --dry-run              Print the plan. Projection seeds are still written
+  --fidelity             Default L2 (or fidelity from .stp/config.toml)
+  --profile <name>       Source Codex account
+  --codex-home <path>    Source Codex home
+  --into-profile <name>  Target Codex account
+  --into-codex-home <path>
+                         Target Codex home
+
+Different Codex homes always use a projection fork. The child is started
+with CODEX_HOME set to the target directory. STP does not copy auth.json.
 
 Native fork (original session untouched):
   claude --resume <id> --fork-session
@@ -584,10 +727,13 @@ Resume in place (cursor, agy, deepseek) when you do not pass --last,
 --since-compact, or --projection. Trimming always uses a projection seed,
 because native resume cannot drop history.
 
-Cross-agent fork writes .stp/handoffs/<stamp>-<from>-to-<to>/agent.md
-and, when the target is launchable, starts it with a prompt pointing at
-that file. The seed tells the target to check git before trusting the
-transcript.
+Cross-agent fork, and Codex forks whose source and target homes differ,
+write .stp/handoffs/<stamp>-<from>-to-<to>/agent.md and start the target
+with a prompt pointing at that file. Same-home Codex forks still run
+\`codex fork\` with CODEX_HOME set to that account.
+
+Example:
+  stp fork codex --profile sub --into-profile api --since-compact
 `;
   }
   return `stp init — write .stp/config.toml in the current directory

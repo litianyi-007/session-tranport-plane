@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const cli = fileURLToPath(new URL("../cli.js", import.meta.url));
+const SENTINEL = "codex-auth-sentinel-marker";
 
 function run(args: string[], extra?: { cwd?: string; env?: NodeJS.ProcessEnv; input?: string }) {
   const env = { ...process.env, ...(extra?.env ?? {}) };
@@ -19,6 +20,7 @@ function run(args: string[], extra?: { cwd?: string; env?: NodeJS.ProcessEnv; in
     "GROK_HOME",
     "DSH_HOME",
     "CURSOR_HOME",
+    "STP_CODEX_HOME",
   ]) {
     if (!extra?.env || !(key in extra.env)) delete env[key];
   }
@@ -111,6 +113,7 @@ test("list, read, and fork against a fixture home", () => {
   assert.match(list.stdout, /codex/);
   assert.match(list.stdout, /codex-9/);
   assert.match(list.stdout, /claude/);
+  assert.doesNotMatch(list.stdout, /PROFILE/);
 
   const listed = run(["list", "--agent", "codex", "--json"], { cwd, env });
   assert.equal(listed.status, 0, listed.stderr);
@@ -146,6 +149,7 @@ test("list, read, and fork against a fixture home", () => {
   assert.equal(native.status, 0, native.stderr);
   assert.match(native.stdout, /kind: native-fork/);
   assert.match(native.stdout, /command: codex fork codex-9/);
+  assert.doesNotMatch(native.stdout, /projection fork:/);
   assert.equal(existsSync(join(cwd, ".stp", "handoffs")), false);
 
   const cross = run(["fork", "codex", "--into", "pi", "--dry-run", "--since-compact"], { cwd, env });
@@ -166,6 +170,7 @@ test("list, read, and fork against a fixture home", () => {
   const trimmedSame = run(["fork", "codex", "--since-compact", "--no-launch"], { cwd, env });
   assert.match(trimmedSame.stdout, /kind: projection/);
   assert.match(trimmedSame.stdout, /into: codex/);
+  assert.doesNotMatch(trimmedSame.stdout, /projection fork:/);
 
   const piped = run(["fork", "--from", "-", "--into", "claude", "--dry-run"], {
     cwd,
@@ -188,6 +193,149 @@ test("init writes config and unknown agents fail", () => {
   assert.equal(missing.status, 1);
   assert.match(missing.stderr, /Unknown agent/);
 });
+
+test("codex profiles tag every home and project across accounts", () => {
+  const home = mkdtempSync(join(tmpdir(), "stp-prof-"));
+  const cwd = mkdtempSync(join(tmpdir(), "stp-prof-proj-"));
+  const sub = join(home, ".codex");
+  const api = join(home, ".codex-api");
+  mkdirSync(join(home, ".stp"), { recursive: true });
+  writeFileSync(
+    join(home, ".stp", "config.toml"),
+    [
+      "[profiles.codex.sub]",
+      'home = "~/.codex"',
+      'label = "ChatGPT subscription"',
+      "",
+      "[profiles.codex.api]",
+      'home = "~/.codex-api"',
+      'label = "API key"',
+      "",
+    ].join("\n"),
+  );
+  writeRollout(sub, "codex-sub-1", cwd, "Ship the subscription thread", "2026-03-02T00:00:00.000Z", true);
+  writeRollout(api, "codex-api-1", cwd, "Ship the api thread", "2026-03-01T00:00:00.000Z", false);
+  const sentinel = JSON.stringify({ OPENAI_API_KEY: SENTINEL, token: SENTINEL });
+  writeFileSync(join(sub, "auth.json"), sentinel);
+  writeFileSync(join(api, "auth.json"), sentinel);
+  const env = { HOME: home, USERPROFILE: home };
+
+  const list = run(["list", "--agent", "codex", "--json"], { cwd, env });
+  assert.equal(list.status, 0, list.stderr);
+  const rows = JSON.parse(list.stdout) as { native_id: string; profile?: string; home?: string }[];
+  assert.deepEqual(
+    rows.map((row) => row.profile).sort(),
+    ["api", "sub"],
+  );
+  assert.equal(rows.find((row) => row.native_id === "codex-sub-1")?.home, realpathSync(sub));
+  assert.equal(rows.find((row) => row.native_id === "codex-api-1")?.home, realpathSync(api));
+  assert.doesNotMatch(list.stdout, new RegExp(SENTINEL));
+
+  const table = run(["list", "--agent", "codex"], { cwd, env });
+  assert.match(table.stdout, /PROFILE/);
+  assert.match(table.stdout, /sub \(/);
+  assert.match(table.stdout, /api \(/);
+
+  const filtered = run(["list", "--agent", "codex", "--profile", "api", "--json"], { cwd, env });
+  assert.equal(filtered.status, 0, filtered.stderr);
+  const apiRows = JSON.parse(filtered.stdout) as { native_id: string }[];
+  assert.deepEqual(apiRows.map((row) => row.native_id), ["codex-api-1"]);
+
+  const both = run(["list", "--profile", "sub", "--codex-home", sub], { cwd, env });
+  assert.equal(both.status, 1);
+  assert.match(both.stderr, /either --profile or --codex-home/);
+
+  const unknown = run(["list", "--profile", "missing"], { cwd, env });
+  assert.equal(unknown.status, 1);
+  assert.match(unknown.stderr, /Unknown Codex profile "missing"/);
+  assert.match(unknown.stderr, /sub, api/);
+
+  const early = run(
+    ["fork", "codex", "--profile", "sub", "--into-codex-home", join(home, ".codex-missing"), "--dry-run"],
+    { cwd, env },
+  );
+  assert.equal(early.status, 1);
+  assert.match(early.stderr, /does not exist/);
+  assert.equal(existsSync(join(cwd, ".stp", "handoffs")), false);
+
+  const cross = run(["fork", "codex", "--profile", "sub", "--into-profile", "api", "--dry-run"], { cwd, env });
+  assert.equal(cross.status, 0, cross.stderr);
+  assert.match(cross.stdout, /projection fork: sub \(~\/\.codex\) → api \(~\/\.codex-api\)/);
+  assert.match(cross.stdout, /kind: projection/);
+  assert.match(cross.stdout, /command: codex /);
+  assert.doesNotMatch(cross.stdout, /codex fork /);
+  assert.match(cross.stdout, new RegExp(`CODEX_HOME=${escapeRegExp(realpathSync(api))}`));
+  assert.doesNotMatch(`${cross.stdout}\n${cross.stderr}`, new RegExp(SENTINEL));
+  const seedLine = cross.stdout.split("\n").find((line) => line.startsWith("seed: "));
+  assert.ok(seedLine);
+  const seed = seedLine.slice("seed: ".length);
+  const seedBody = readFileSync(seed, "utf8");
+  const fingerprint = readFileSync(join(seed, "..", "fingerprint.json"), "utf8");
+  assert.match(seedBody, /Ship the subscription thread/);
+  assert.doesNotMatch(seedBody, new RegExp(SENTINEL));
+  assert.doesNotMatch(fingerprint, new RegExp(SENTINEL));
+  assert.match(fingerprint, /"into_profile": "api"/);
+  assert.match(fingerprint, /"from_profile": "sub"/);
+  assert.doesNotMatch(fingerprint, /auth\.json/);
+
+  const trimmed = run(
+    ["fork", "codex", "--profile", "sub", "--into-profile", "api", "--since-compact", "--dry-run"],
+    { cwd, env },
+  );
+  assert.match(trimmed.stdout, /kind: projection/);
+  const trimmedSeed = trimmed.stdout.split("\n").find((line) => line.startsWith("seed: "));
+  assert.ok(trimmedSeed);
+  const trimmedBody = readFileSync(trimmedSeed.slice("seed: ".length), "utf8");
+  const trimmedTranscript = trimmedBody.split("## Transcript")[1] ?? "";
+  assert.match(trimmedTranscript, /After compact/);
+  assert.doesNotMatch(trimmedTranscript, /Ship the subscription thread/);
+
+  const same = run(["fork", "codex", "--profile", "sub", "--into-profile", "sub", "--dry-run"], { cwd, env });
+  assert.equal(same.status, 0, same.stderr);
+  assert.match(same.stdout, /kind: native-fork/);
+  assert.match(same.stdout, /command: codex fork codex-sub-1/);
+  assert.match(same.stdout, new RegExp(`CODEX_HOME=${escapeRegExp(realpathSync(sub))}`));
+  assert.doesNotMatch(same.stdout, /projection fork:/);
+  assert.doesNotMatch(same.stdout, /^seed: /m);
+
+  const byPath = run(
+    ["fork", "codex", "--codex-home", "~/.codex", "--into-codex-home", "~/.codex-api", "--dry-run"],
+    { cwd, env },
+  );
+  assert.equal(byPath.status, 0, byPath.stderr);
+  assert.match(byPath.stdout, /projection fork: sub \(~\/\.codex\) → api \(~\/\.codex-api\)/);
+  assert.match(byPath.stdout, /kind: projection/);
+  assert.match(byPath.stdout, new RegExp(`CODEX_HOME=${escapeRegExp(realpathSync(api))}`));
+});
+
+function writeRollout(home: string, id: string, cwd: string, user: string, iso: string, compacted: boolean): void {
+  const [year, month, day] = iso.slice(0, 10).split("-");
+  const dir = join(home, "sessions", year ?? "", month ?? "", day ?? "");
+  mkdirSync(dir, { recursive: true });
+  const lines = [
+    JSON.stringify({ timestamp: iso, type: "session_meta", payload: { id, cwd, timestamp: iso } }),
+    JSON.stringify({ timestamp: iso, type: "event_msg", payload: { type: "user_message", message: user } }),
+  ];
+  if (compacted) {
+    lines.push(
+      JSON.stringify({
+        timestamp: iso,
+        type: "event_msg",
+        payload: { type: "context_compacted", message: "Compacted subscription context" },
+      }),
+      JSON.stringify({
+        timestamp: iso,
+        type: "event_msg",
+        payload: { type: "user_message", message: "After compact" },
+      }),
+    );
+  }
+  writeFileSync(join(dir, `rollout-${id}.jsonl`), lines.join("\n"));
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 function encodeDashes(input: string): string {
   return input.replace(/[^A-Za-z0-9]/g, "-").replace(/-+/g, "-");
