@@ -73,7 +73,8 @@ What runs:
 
 | Situation | What STP does |
 | --- | --- |
-| Same agent, native fork, no trimming | Delegates. Claude, Codex, Pi, and Grok. |
+| Same agent, same Codex home, native fork, no trimming | Delegates. Claude, Codex, Pi, and Grok. The Codex child gets `CODEX_HOME` for that account. |
+| Same agent, different Codex home | Projection fork. Native `codex fork` is not used. The child gets the target `CODEX_HOME`. |
 | Same agent, resume only, no trimming | Resumes in place and says so. Cursor, Antigravity, DeepSeek Harness. |
 | `--last`, `--since-compact`, or `--projection` | Writes a new projection. Native resume cannot drop history. |
 | Different `--into` agent | Writes `.stp/handoffs/<stamp>-<from>-to-<to>/agent.md` and starts the target with a prompt that points at that file. |
@@ -144,6 +145,42 @@ Encoded cwd forms:
 - **Pi** entries off the active branch are ignored. System prompt messages are not copied into CSIR.
 - **Launch flags** for projection mode pass a short prompt that names the seed file. They do not inject the whole transcript through argv. If a CLI ignores a positional prompt, use the seed path printed above the launch.
 
+## Codex multi-account (subscription ↔ API)
+
+A ChatGPT subscription login and an API-key login are different Codex accounts. Each account is a `CODEX_HOME` directory with its own `auth.json` and `sessions/`. STP moves a conversation projection between those directories. Billing and rate limits stay with the account that serves the new thread. STP leaves each `auth.json` in place and only sets `CODEX_HOME` on the launched process.
+
+Create each home and log in once:
+
+```bash
+mkdir -p ~/.codex ~/.codex-api
+CODEX_HOME=~/.codex codex login
+CODEX_HOME=~/.codex-api codex login
+```
+
+Name the homes in `~/.stp/config.toml`, the project `.stp/config.toml`, or both. A project file replaces a global profile with the same name.
+
+```toml
+[profiles.codex.sub]
+home = "~/.codex"
+label = "ChatGPT subscription"
+
+[profiles.codex.api]
+home = "~/.codex-api"
+label = "API key"
+```
+
+When any Codex profile is configured, `stp list` and `stp list --agent codex` include sessions from every profile and tag each row with the profile name and home. `--all-profiles` asks for that scan explicitly; it is already the default. `--profile api` limits discovery to one home. With no profiles, the active home is `STP_CODEX_HOME`, then `CODEX_HOME`, then `~/.codex`.
+
+```bash
+stp list --agent codex
+stp fork codex --profile sub --into-profile api --since-compact
+stp fork codex --codex-home ~/.codex --into-codex-home ~/.codex-api --since-compact
+```
+
+The cross-account command prints `projection fork: sub (~/.codex) → api (~/.codex-api)`, writes `.stp/handoffs/.../agent.md`, and starts `codex` with `CODEX_HOME` set to the target directory. That directory has to exist before the fork. A fork back into the same home, with no `--last`, `--since-compact`, or `--projection`, still runs `codex fork`.
+
+Single-home precedence is `--codex-home`, then `--profile`, then `STP_CODEX_HOME`, then `CODEX_HOME`, then `~/.codex`. `--profile` and `--codex-home` together are an error, and the same rule applies to `--into-profile` and `--into-codex-home`.
+
 ## Phase 0 and later
 
 Phase 0, this package:
@@ -154,6 +191,7 @@ Phase 0, this package:
 - `--since-compact`, `--last`, `--from -`
 - native fork or resume when the table above says so
 - a handoff directory with `agent.md` and `fingerprint.json` for projection forks
+- named Codex homes, so a subscription account can hand a projection to an API-key account
 
 Not in this version:
 
@@ -167,7 +205,7 @@ Not in this version:
 npm test
 ```
 
-Tests cover CSIR round-trip, both projectors, redact, each adapter parser, discovery under a temporary home, and the CLI help / list / read / fork paths.
+Tests cover CSIR round-trip, both projectors, redact, each adapter parser, discovery under a temporary home, Codex profile resolution and cross-account projection forks, and the CLI help / list / read / fork paths.
 
 ## License
 

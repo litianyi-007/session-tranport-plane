@@ -11,6 +11,18 @@ export interface SessionRef {
   preview?: string;
   /** Set when the native id alone is not enough (for example a pi file path). */
   launchId?: string;
+  /** Codex account profile name, when more than one home is in play. */
+  profile?: string;
+  /** Absolute CODEX_HOME this session was read from. Paths only; never auth material. */
+  accountHome?: string;
+}
+
+export interface CodexHomeSelection {
+  /** Empty when the row should stay untagged (single default home). */
+  name: string;
+  home: string;
+  label?: string;
+  configured: boolean;
 }
 
 export interface DiscoverOpts {
@@ -19,6 +31,8 @@ export interface DiscoverOpts {
   env: NodeJS.ProcessEnv;
   /** Stop after this many matching sessions. Default 50. */
   matchLimit?: number;
+  /** When set, Codex discovery scans these homes instead of the single CODEX_HOME. */
+  codexHomes?: CodexHomeSelection[];
 }
 
 export interface Capabilities {
@@ -36,6 +50,8 @@ export interface LaunchOpts {
   prompt?: string;
   cwd: string;
   env: NodeJS.ProcessEnv;
+  /** Absolute Codex home to expose as CODEX_HOME in the child. */
+  codexHome?: string;
 }
 
 export interface LaunchPlan {
@@ -43,6 +59,8 @@ export interface LaunchPlan {
   cwd: string;
   mode: LaunchMode;
   note: string;
+  /** Extra environment for the child. Codex launches set only CODEX_HOME. */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface AgentAdapter {
